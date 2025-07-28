@@ -1,0 +1,14 @@
+# Use a single stage (you don’t need multi‑stage for this)
+FROM node:20-alpine
+
+WORKDIR /usr/src/app
+
+COPY package*.json ./
+RUN npm install --production
+RUN npm install concurrently --save
+
+COPY src ./src
+
+EXPOSE 6565
+
+CMD ["npm", "start"]

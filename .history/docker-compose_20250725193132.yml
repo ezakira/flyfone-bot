@@ -1,0 +1,12 @@
+services:
+  flyfone-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - ./.env
+    restart: always
+    volumes:
+      - ./src/cookies.json:/usr/src/app/src/cookies.json
+    ports:
+      - "6565:6565"

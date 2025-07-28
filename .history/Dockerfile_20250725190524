@@ -1,0 +1,18 @@
+# Use a single stage (you don’t need multi‑stage for this)
+FROM node:20-alpine
+
+RUN npm install -g localtunnel
+
+WORKDIR /usr/src/app
+
+COPY package*.json ./
+RUN npm install --production
+
+COPY src ./src
+COPY entrypoint.sh ./
+
+RUN chmod +x ./entrypoint.sh
+
+EXPOSE 3000
+
+ENTRYPOINT ["./entrypoint.sh"]
