@@ -12,6 +12,7 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@supabase/supabase-js": "^2.53.0",
     "axios": "^1.11.0",
     "axios-cookiejar-support": "^6.0.4",
     "chrono-node": "^2.8.3",
