@@ -1,9 +1,0 @@
-FROM node:20-alpine
-WORKDIR /usr/src/app
-COPY package*.json ./
-RUN npm ci --omit=dev
-# copy everything under src/ into /usr/src/app/src
-COPY src ./src
-WORKDIR /usr/src/app/src
-EXPOSE 3000
-CMD ["node", "bot.js"]
