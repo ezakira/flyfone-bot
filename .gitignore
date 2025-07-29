@@ -1,0 +1,8 @@
+# credentials & state
+.env
+cookies.json
+.bot_state.json
+
+# dependencies, editor junk
+node_modules/
+.history/
