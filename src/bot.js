@@ -319,6 +319,8 @@ const sess = sessionMap.get(chatId) || {};
     return beginSheetFlow(ctx);  }
   return beginChatFlow(ctx);
 });
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 4A) Sheet-mode flow: ask creds → calendar
 // ─────────────────────────────────────────────────────────────────────────────
