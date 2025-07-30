@@ -932,6 +932,11 @@ const app = express();
 app.set('trust proxy', true);
 app.use(bodyParser.urlencoded({ extended:false }));
 
+// Add this before your other routes
+app.get('/', (req, res) => {
+  res.status(200).send('Bot is alive!');
+});
+
 app.get('/oauth2callback', async (req, res) => {
   console.log('🔔 /oauth2callback hit with state:', req.query.state);
   const { code, state, error } = req.query; // Add error parameter
