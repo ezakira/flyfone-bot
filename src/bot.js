@@ -929,6 +929,7 @@ bot.callbackQuery(/^sheetMode:(overwrite|append)$/, withSessionGuard(async ctx =
 }));
 
 const app = express();
+app.set('trust proxy', true);
 app.use(bodyParser.urlencoded({ extended:false }));
 
 app.get('/oauth2callback', async (req, res) => {
