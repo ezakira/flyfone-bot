@@ -7,15 +7,21 @@ import { Calendar } from 'grammy-calendar';
 import dayjs from 'dayjs';
 import axios from 'axios';
 import { wrapper } from 'axios-cookiejar-support';
-import { CookieJar } from 'tough-cookie';
 import XLSX from 'xlsx';
-import fs from 'fs';
-import path from 'path';
 import { fileURLToPath } from 'url';
 import levenshtein from 'js-levenshtein';
 import * as chrono from 'chrono-node';
-import { flyfoneCreds, googleCreds, sessionMap, sheetMap, loadState, saveState } from './state.js';
+import {  getRefreshToken, saveRefreshToken, getFlyfoneCreds, deleteFlyfoneCreds, getSession, deleteSession, saveFlyfoneCreds, saveSession, saveSheet, getSheet, loadCookies, saveCookies, deleteRefreshToken, removeAllCookies } from './state.js';
 
+
+console.log('⚙️  Env:', {
+  BOT_TOKEN:    !!process.env.BOT_TOKEN,
+  SUPABASE_URL: !!process.env.SUPABASE_URL,
+  SUPABASE_KEY: !!process.env.SUPABASE_KEY,
+  GOOGLE_CLIENT_ID:     !!process.env.GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET: !!process.env.GOOGLE_CLIENT_SECRET,
+  BOT_REDIRECT_URI:     !!process.env.BOT_REDIRECT_URI,
+});
 // ── Shared in‑memory credentials store ─────────────────────────────────────────
 
 // ── OAuth2 client setup ───────────────────────────────────────────────────────
@@ -33,6 +39,9 @@ const oauth2Client = new google.auth.OAuth2(
   BOT_REDIRECT_URI
 );
 
+const FLYFONE_BASE = 'https://my.flyfonetalk.com';
+
+
 // ── Telegram bot setup ─────────────────────────────────────────────────────────
 const bot = new Bot(BOT_TOKEN);
 bot.use(session({ initial: () => ({ calendarOptions: {} }) }));
@@ -44,90 +53,175 @@ function replyBold(ctx, text, extra = {}) {
 }
 
 // ── Google Sheets helpers ─────────────────────────────────────────────────────
-function getSheetsClientForUser(chatId) {
-  const creds = googleCreds.get(chatId);
-  if (!creds || !creds.refresh_token) throw new Error('User not authorized');
-  const auth = new google.auth.OAuth2(
-    GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, BOT_REDIRECT_URI
-  );
-  auth.setCredentials({ refresh_token: creds.refresh_token });
-  return google.sheets({ version: 'v4', auth });
+async function getSheetsClientForUser(chatId) {
+  try {
+    const refreshToken = await getRefreshToken(chatId);
+  if (refreshToken && typeof refreshToken === 'object') {
+    console.error('Corrupted token format detected - deleting invalid token');
+    await deleteRefreshToken(chatId);
+    throw new Error('Invalid token format - please reauthenticate');
+  }
+
+    const auth = new google.auth.OAuth2(
+      GOOGLE_CLIENT_ID, 
+      GOOGLE_CLIENT_SECRET, 
+      BOT_REDIRECT_URI
+    );
+    
+    auth.setCredentials({ refresh_token: refreshToken });
+    
+    // Return the actual sheets client
+    return google.sheets({ version: 'v4', auth });
+  } catch (err) {
+    console.error('Error creating Sheets client:', err);
+    throw new Error('Failed to create Sheets client');
+  }
 }
 
 async function writeToSheet(chatId, spreadsheetId, rows, overwrite = false) {
-  const sheets = getSheetsClientForUser(chatId);
-  const range = 'Sheet1!A1:Z';
-  if (overwrite) {
-    await sheets.spreadsheets.values.clear({ spreadsheetId, range });
-    await sheets.spreadsheets.values.update({
-      spreadsheetId, range: 'Sheet1!A1', valueInputOption: 'RAW',
-      requestBody: { values: rows },
-    });
-  } else {
-    await sheets.spreadsheets.values.append({
-      spreadsheetId, range: 'Sheet1!A1', valueInputOption: 'RAW',
-      insertDataOption: 'INSERT_ROWS',
-      requestBody: { values: rows },
-    });
-  }
-}
-
-// ── Flyfone scraping helpers ──────────────────────────────────────────────────
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
-const COOKIE_FILE = path.resolve(__dirname, '../cookies.json');
-
-function loadCookieJar() {
-  if (fs.existsSync(COOKIE_FILE)) {
-    try { return CookieJar.fromJSON(JSON.parse(fs.readFileSync(COOKIE_FILE))); }
-    catch {}
-  }
-  return new CookieJar();
-}
-
-function saveCookieJar(jar) {
-  fs.writeFileSync(COOKIE_FILE, JSON.stringify(jar.toJSON(), null, 2));
-}
-
-const jar    = loadCookieJar();
-const client = wrapper(axios.create({ jar, withCredentials: true }));
-const FLYFONE_BASE = 'https://my.flyfonetalk.com';
-
-async function ensureLoggedIn(email, password) {
   try {
-    await client.get(`${FLYFONE_BASE}/dashboard`, { maxRedirects: 0, validateStatus: s => s === 200 });
+    const sheets = await getSheetsClientForUser(chatId);
+    const range = 'Sheet1!A1:Z';
+    if (overwrite) {
+      await sheets.spreadsheets.values.clear({ spreadsheetId, range });
+      await sheets.spreadsheets.values.update({
+        spreadsheetId,
+        range: 'Sheet1!A1',
+        valueInputOption: 'RAW',
+        resource: { values: rows },
+      });
+    } else {
+      await sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range: 'Sheet1!A1',
+        valueInputOption: 'RAW',
+        insertDataOption: 'INSERT_ROWS',
+        resource: { values: rows },
+      });
+    }
+  } catch (err) {
+    console.error('Error writing to sheet:', err);
+    throw err;
+  }
+}
+// ── Flyfone scraping helpers ──────────────────────────────────────────────────
+
+/**
+ * Returns an axios client with the user's cookies loaded from Supabase.
+ * @param {number} chatId
+ * @returns {Promise<AxiosInstance>}
+ */
+export async function getFlyfoneClient(chatId) {
+  console.log(`🔄 getFlyfoneClient: loading cookies for chatId=${chatId}`);
+  const jar = await loadCookies(chatId);
+  console.log(`✔️ loadCookies returned jar for chatId=${chatId}`, jar.constructor.name);
+  return wrapper(axios.create({ jar, withCredentials: true }));
+}
+
+
+export async function ensureLoggedIn(chatId, email, password, client, jar) {
+  console.log(`↪️ ensureLoggedIn(${chatId}, ${email}, [password redacted])`);
+
+  // 1. If already logged in, the dashboard will return 200
+  try {
+    await client.get(
+      `${FLYFONE_BASE}/dashboard`,
+      { maxRedirects: 0, validateStatus: s => s === 200 }
+    );
+    console.log('✅ Already logged in');
+    return;
   } catch {
-    const loginPage = await client.get(`${FLYFONE_BASE}/login`, { validateStatus: s => s === 200 });
-    const match = loginPage.data.match(/name="csrf_webcall" value="([^"]+)"/);
-    if (!match) throw new Error('CSRF token not found');
-    const csrf = match[1];
-    const resp = await client.post(
+    console.log('🔄 Not logged in, will fetch login page...');
+  }
+
+  // 2. Fetch login page to get CSRF token
+  let loginPage;
+  try {
+    loginPage = await client.get(
       `${FLYFONE_BASE}/login`,
-      new URLSearchParams({ csrf_webcall: csrf, username: email, password }),
-      { maxRedirects: 0, validateStatus: s => [302,303,200].includes(s),
-        headers: { 'Content-Type':'application/x-www-form-urlencoded', Referer:`${FLYFONE_BASE}/login`, Origin:FLYFONE_BASE }
+      { validateStatus: s => s === 200 }
+    );
+    console.log('✅ Loaded login page');
+  } catch (err) {
+    console.error('❌ Failed to load login page:', err);
+    throw err;
+  }
+
+  const match = loginPage.data.match(/name="csrf_webcall" value="([^"]+)"/);
+  if (!match) {
+    const err = new Error('CSRF token not found');
+    console.error('❌', err);
+    throw err;
+  }
+  const csrf = match[1];
+
+  // 3. POST credentials
+  let resp;
+  try {
+    resp = await client.post(
+      `${FLYFONE_BASE}/login`,
+      new URLSearchParams({ csrf_webcall: csrf, username: email, password: password }),
+      {
+        maxRedirects: 0,
+        validateStatus: s => [302, 303, 200].includes(s),
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Referer: `${FLYFONE_BASE}/login`,
+          Origin: FLYFONE_BASE
+        }
       }
     );
-    if (resp.status === 200 && resp.data.includes('password is incorrect')) {
-      throw new Error('Incorrect email or password');
-    }
-    saveCookieJar(jar);
+    console.log('➡️ Login POST status:', resp.status);
+    console.log(
+      '   Response snippet:',
+      typeof resp.data === 'string'
+        ? resp.data.slice(0, 200).replace(/\n/g, ' ')
+        : '[binary]'
+    );
+  } catch (err) {
+    console.error('❌ Login POST failed:', err);
+    throw err;
+  }
+
+  // 4. Detect wrong credentials
+  if (resp.status === 200 && resp.data.includes('password is incorrect')) {
+    const err = new Error('Incorrect email or password');
+    console.error('❌', err);
+    throw err;
+  }
+
+  // 5. Persist cookies to Supabase
+  try {
+    await saveCookies(chatId, jar);
+    console.log('✔️ saveCookies succeeded');
+  } catch (err) {
+    console.error('❌ saveCookies failed:', err);
+    throw err;
   }
 }
 
-async function downloadFlyfoneReport(dateStr, email, password) {
-  await ensureLoggedIn(email, password);
+
+export async function downloadFlyfoneReport(chatId, dateStr, email, password, client, jar) {
+  await ensureLoggedIn(chatId, email, password, client, jar);
+
   const qs = new URLSearchParams({
-    from_date: dateStr, to_date: dateStr,
-    phone:'', status:'0', autodial_id:'', team_id:'0'
+    from_date: dateStr,
+    to_date: dateStr,
+    phone: '',
+    status: '0',
+    autodial_id: '',
+    team_id: '0'
   }).toString();
+
   const resp = await client.get(`${FLYFONE_BASE}/api/export/voice?${qs}`, {
-    headers:{Accept:'application/vnd.ms-excel'},
-    responseType:'arraybuffer'
+    headers: { Accept: 'application/vnd.ms-excel' },
+    responseType: 'arraybuffer'
   });
+
   if (resp.status !== 200) throw new Error(`Export failed: ${resp.status}`);
-  const wb = XLSX.read(resp.data, { type:'buffer' });
-  return XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header:1 });
+
+  const wb = XLSX.read(resp.data, { type: 'buffer' });
+  return XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1 });
 }
 
 // ── In‑memory session storage ─────────────────────────────────────────────────
@@ -135,11 +229,11 @@ async function downloadFlyfoneReport(dateStr, email, password) {
 function withSessionGuard(handler) {
   return async (ctx, ...args) => {
     const chatId = ctx.chat?.id || ctx.from?.id;
-    const sess = sessionMap.get(chatId);
+    const sess = await getSession(chatId);
     if (!sess) {
       await ctx.reply('<b>Session expired! Restarting...</b>', { parse_mode: 'HTML' });
       // Simulate /start command
-      sessionMap.delete(chatId);
+      await deleteSession(chatId);
       const kb = new InlineKeyboard()
         .text('Yes, link a sheet', 'linkSheet:yes')
         .text('No, keep in chat', 'linkSheet:no');
@@ -171,18 +265,30 @@ function parseDateInput(input) {
 // ─────────────────────────────────────────────────────────────────────────────
 bot.command('start', async ctx => {
   const chatId = ctx.chat.id;
-  sessionMap.delete(chatId);
-  flyfoneCreds.delete(chatId); // fresh start
+  const existingCreds = await getFlyfoneCreds(chatId);
+  if (existingCreds) {
+    // User already logged in - show mode selection
+    const kb = new InlineKeyboard()
+      .text('Yes, link a sheet', 'linkSheet:yes')
+      .text('No, keep in chat', 'linkSheet:no');
+      
+    return ctx.reply('<b>Do you want to connect your Google Sheet?</b>', {
+      parse_mode: 'HTML',
+      reply_markup: kb
+    });
+  } else {
+  await deleteSession(chatId);
+  await deleteFlyfoneCreds(chatId); // fresh start
 
   const sess = { step: 'await_email' };
-  sessionMap.set(chatId, sess);
+  await saveSession(chatId, sess);
   return replyBold(ctx, 'Enter your Flyfone email:');
-});
+}});
 
 bot.callbackQuery(/^linkSheet:yes$/, async ctx => {
   const chatId = ctx.chat.id;
-  sessionMap.set(chatId, {
-    ...sessionMap.get(chatId),
+  await saveSession(chatId, {
+    ...await getSession(chatId),
     connectSheet: true,
     mode: 'sheet',
     step: 'await_sheet_url'
@@ -194,46 +300,73 @@ bot.callbackQuery(/^linkSheet:yes$/, async ctx => {
   bot.callbackQuery(/^linkSheet:no$/, async ctx => {
   const chatId = ctx.chat.id;
   // mark this chat to stay in chat mode
-  sessionMap.set(chatId, { connectSheet: false, mode: 'chat' });
+  await saveSession(chatId, { connectSheet: false, mode: 'chat' });
   await ctx.answerCallbackQuery();
   return replyBold(ctx, 'Chat mode enabled!\n\n Fetch /fetch to start.');
 });
 
 bot.command('mode', async ctx => {
   const chatId = ctx.chat.id;
+  const creds = await getFlyfoneCreds(chatId);
+  
+  // Check for arguments first
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length > 0) {
+    const mode = args[0].toLowerCase();
+    
+    if (!creds) {
+      return replyBold(ctx, 'You are not logged in. Use /start to log in first.');
+    }
+    
+    if (mode === 'chat') {
+      await saveSession(chatId, {
+        ...(await getSession(chatId) || {}),
+        mode: 'chat',
+        connectSheet: false
+      });
+      return replyBold(ctx, 'Chat mode enabled!');
+    }
+    
+    if (mode === 'sheet') {
+      await saveSession(chatId, {
+        ...(await getSession(chatId) || {}),
+        mode: 'sheet',
+        connectSheet: true
+      });
+      return replyBold(ctx, 'Sheet mode enabled!');
+    }
+    
+    return replyBold(ctx, 'Invalid mode. Use "/mode chat" or "/mode sheet"');
+  }
 
-  if (!flyfoneCreds.has(chatId)) {
+  // No arguments - show mode selection
+  if (!creds) {
     return replyBold(ctx, 'You are not logged in. Use /start to log in first.');
   }
 
   const kb = new InlineKeyboard()
-    .text('Yes, link a sheet', 'linkSheet:yes')
-    .text('No, keep in chat', 'linkSheet:no');
+    .text('Sheet mode', 'linkSheet:yes')
+    .text('Chat mode', 'linkSheet:no');
 
-  await ctx.reply('<b>Choose your mode:</b>', {
+  return ctx.reply('<b>Choose your mode:</b>', {
     parse_mode: 'HTML',
     reply_markup: kb
   });
 });
-
 // ─────────────────────────────────────────────────────────────────────────────
 // ❚❚ /logout: clear creds + cookies in both disk & memory
 // ─────────────────────────────────────────────────────────────────────────────
 bot.command('logout', async ctx => {
   const chatId = ctx.chat.id;
-
-  // 1) clear our maps
-  flyfoneCreds.delete(chatId);
-  googleCreds.delete(chatId);
-  sessionMap.delete(chatId);
-
-  // 2) delete the on‑disk cookie file
-  if (fs.existsSync(COOKIE_FILE)) {
-    fs.unlinkSync(COOKIE_FILE);
-  }
-
-  // 3) wipe the live CookieJar in RAM
-  await jar.removeAllCookies();
+  
+  // Clear all user data
+  await Promise.all([
+    deleteFlyfoneCreds(chatId),
+    deleteRefreshToken(chatId),
+    deleteSession(chatId),
+    removeAllCookies(chatId),
+    deleteSheet(chatId)
+  ]);
 
   return ctx.reply(
     '<b>You’ve been logged out.</b>\n\n' + 
@@ -248,7 +381,7 @@ bot.command('logout', async ctx => {
 // ─────────────────────────────────────────────────────────────────────────────
 bot.command('sheet', async ctx => {
   const chatId = ctx.chat.id;
-  const sess   = sessionMap.get(chatId) || {};
+  const sess   = await getSession(chatId) || {};
 
   if (!sess.connectSheet) {
     return replyBold(ctx, 'Not in Sheet mode. Use /mode to switch.');
@@ -270,9 +403,9 @@ bot.command('sheet', async ctx => {
     );
   }
 
-  const creds = googleCreds.get(chatId);
-  sessionMap.set(chatId, { ...sess, sheetId });
-  sheetMap.set(chatId, sheetId);
+  const creds = await getRefreshToken(chatId);
+  await saveSession(chatId, { ...sess, sheetId });
+  await saveSheet(chatId, sheetId);
 
   if (creds?.refresh_token) {
     return replyBold(ctx, 'Sheet linked! Now use /fetch to export.');
@@ -280,6 +413,7 @@ bot.command('sheet', async ctx => {
 
   // Not authorized — prompt OAuth now
   const state = encodeURIComponent(JSON.stringify({ chatId }));
+
   const consentUrl = oauth2Client.generateAuthUrl({
     access_type: 'offline',
     scope: [
@@ -303,10 +437,10 @@ bot.command('sheet', async ctx => {
 // ─────────────────────────────────────────────────────────────────────────────
 bot.command('fetch', async ctx => {
   const chatId = ctx.chat.id;
-const sess = sessionMap.get(chatId) || {};
-  const creds = flyfoneCreds.get(chatId);
+const sess = await getSession(chatId) || {};
+const creds = await getFlyfoneCreds(chatId);
     // If they already linked a sheet, default to sheet‑mode
-  const linkedSheet = sheetMap.get(chatId);
+  const linkedSheet = await getSheet(chatId);
   const mode = sess.mode || (linkedSheet ? 'sheet' : null);
   if (!creds) return replyBold(ctx, 'You are not logged in. Use /start.');
   if (!mode) return replyBold(ctx, 'No mode selected. Use /mode to pick one.');
@@ -326,15 +460,16 @@ const sess = sessionMap.get(chatId) || {};
 // ─────────────────────────────────────────────────────────────────────────────
 async function beginSheetFlow(ctx) {
   const chatId = ctx.chat.id;
-  const sess   = sessionMap.get(chatId);
-  const sheetId= sheetMap.get(chatId);
+  const sess   = await getSession(chatId);
+  const sheetId= await getSheet(chatId);
   if (!sheetId) return replyBold(ctx, 'Send /sheet first.');
 
-const creds = flyfoneCreds.get(chatId);
+const creds = await getFlyfoneCreds(chatId);
+
 if (!creds) return replyBold(ctx, 'You are not logged in. Use /start to log in.');
 
   sess.step = 'sheet_await_date';
-  sessionMap.set(chatId, sess);
+  await saveSession(chatId, sess);
   console.log('💡 [DEBUG] beginSheetFlow skipping creds, step=sheet_await_date');
   ctx.session.calendarOptions = { defaultDate: dayjs().subtract(1, 'day').toDate() };
 return ctx.reply('<b>Please choose a date:</b>', {
@@ -345,30 +480,31 @@ return ctx.reply('<b>Please choose a date:</b>', {
 
 // Calendar handler for Sheet-mode
 bot.filter(
-  ctx =>
-    ctx.calendarSelectedDate &&
-    sessionMap.get(ctx.chat.id)?.step === 'sheet_await_date',
+  async ctx => {
+    if (!ctx.calendarSelectedDate) return false;
+    const session = await getSession(ctx.chat.id);
+    return session?.step === 'sheet_await_date';
+  },
   async ctx => {
     const chatId = ctx.chat.id;
-    const sess   = sessionMap.get(chatId);
-    const { email, pass } = flyfoneCreds.get(chatId);
-    console.log('💡 [DEBUG-cal] creds for', chatId, flyfoneCreds.get(chatId));
+    const sess = await getSession(chatId);
+    const { email, pass } = await getFlyfoneCreds(chatId);
+    console.log('💡 [DEBUG-cal] creds for', chatId, await getFlyfoneCreds(chatId));
     const dateStr = dayjs(ctx.calendarSelectedDate).format('YYYY-MM-DD');
     replyBold(ctx, `Exporting calls for ${dateStr}…`);
-    return startFetchFlow(ctx, email, pass, sheetMap.get(chatId), dateStr);
+    return startFetchFlow(ctx, email, pass, await getSheet(chatId), dateStr);
   }
-);
-
-// ─────────────────────────────────────────────────────────────────────────────
+);// ─────────────────────────────────────────────────────────────────────────────
 // 4B) Chat-mode flow: unchanged
 // ─────────────────────────────────────────────────────────────────────────────
 async function beginChatFlow(ctx) {
   const chatId = ctx.chat.id;
-  const sess   = sessionMap.get(chatId);
+  const sess   = await getSession(chatId);
 
-const creds = flyfoneCreds.get(chatId);
-  sess.step = 'chat_await_date';
-  sessionMap.set(chatId, sess);
+const creds = await getFlyfoneCreds(chatId);
+
+sess.step = 'chat_await_date';
+  await saveSession(chatId, sess);
   ctx.session.calendarOptions = { defaultDate: dayjs().subtract(1, 'day').toDate() };
 return replyBold(
   ctx,
@@ -378,21 +514,25 @@ return replyBold(
 }
 
 bot.filter(
-  ctx =>
-    ctx.calendarSelectedDate &&
-    sessionMap.get(ctx.chat.id)?.step === 'chat_await_date',
+  async ctx => {
+    if (!ctx.calendarSelectedDate) return false;
+    const session = await getSession(ctx.chat.id);
+    return session?.step === 'chat_await_date';
+  },
   async ctx => {
     const chatId = ctx.chat.id;
-    const sess   = sessionMap.get(chatId);
+    const sess   = await getSession(chatId);
     const dateStr = dayjs(ctx.calendarSelectedDate).format('YYYY-MM-DD');
     replyBold(ctx, `Fetching calls for ${dateStr}…`);
-    const { email, pass } = flyfoneCreds.get(chatId);
+    const { email, pass } = await getFlyfoneCreds(chatId);
 
-    const rows = await downloadFlyfoneReport(dateStr, email, pass);
-
+const jar = await loadCookies(chatId);
+const client = wrapper(axios.create({ jar, withCredentials: true }));
+const rows = await downloadFlyfoneReport(chatId, dateStr, email, pass, client, jar);
     // Log the parsed XLSX data to the console for debugging
+    console.log('Parsed XLSX rows:', rows);
 
-    sessionMap.set(chatId, { ...sess, rows, dateStr });
+    await saveSession(chatId, { ...sess, rows, dateStr });
 
     const rawTeams = rows.slice(1).map(r => r[6] || '');
     const teams    = Array.from(new Set(rawTeams));
@@ -408,10 +548,10 @@ bot.filter(
 
 bot.callbackQuery(/^chat_team:(.+)$/, withSessionGuard(async ctx => {
   const chatId = ctx.chat.id;
-  const { rows, dateStr } = sessionMap.get(chatId);
+  const { rows, dateStr } = await getSession(chatId);
   const team = ctx.match[1];
 
-  sessionMap.set(chatId, { ...sessionMap.get(chatId), selectedTeam: team });
+  await saveSession(chatId, { ...await getSession(chatId), selectedTeam: team });
 
   
   const agents = Array.from(
@@ -428,7 +568,7 @@ bot.callbackQuery(/^chat_team:(.+)$/, withSessionGuard(async ctx => {
 bot.callbackQuery(/^chat_agent:(.+)\|(.+)$/, withSessionGuard(async ctx => {
   const chatId = ctx.chat.id;
   const [, team, agent] = ctx.match;
-  const { rows, dateStr } = sessionMap.get(chatId);
+  const { rows, dateStr } = await getSession(chatId);
 
   // Use correct indexes based on your data sample
   const filtered = rows
@@ -456,7 +596,7 @@ bot.callbackQuery(/^chat_agent:(.+)\|(.+)$/, withSessionGuard(async ctx => {
 // ─────────────────────────────────────────────────────────────────────────────
 bot.command('team', withSessionGuard(async ctx => {
   const chatId = ctx.chat.id;
-  const sess = sessionMap.get(chatId);
+  const sess = await getSession(chatId);
 
   // Only allow in chat mode, with rows loaded
   if (!sess || sess.mode !== 'chat' || !sess.rows) {
@@ -482,7 +622,7 @@ bot.command('team', withSessionGuard(async ctx => {
 // ─────────────────────────────────────────────────────────────────────────────
 bot.command('agent', withSessionGuard(async ctx => {
   const chatId = ctx.chat.id;
-  const sess = sessionMap.get(chatId);
+  const sess = await getSession(chatId);
 
   // Parse argument
   const input = ctx.message.text.split(' ').slice(1).join(' ').trim().toLowerCase();
@@ -556,9 +696,9 @@ bot.command('agent', withSessionGuard(async ctx => {
 // Update selectedTeam in chat_team callback
 bot.callbackQuery(/^chat_team:(.+)$/, withSessionGuard(async ctx => {
   const chatId = ctx.chat.id;
-  const { rows, dateStr } = sessionMap.get(chatId);
+  const { rows, dateStr } = await getSession(chatId);
   const team = ctx.match[1];
-  sessionMap.set(chatId, { ...sessionMap.get(chatId), selectedTeam: team }); // Save selected team
+  await saveSession(chatId, { ...await getSession(chatId), selectedTeam: team }); // Save selected team
 
   const agents = Array.from(
     new Set(rows.slice(1).filter(r => r[6] === team).map(r => r[5]))
@@ -590,7 +730,7 @@ bot.command('summary',
     const dateStr = dayjs(dateObj).format('YYYY-MM-DD');
 
     const chatId = ctx.chat.id;
-    const creds  = flyfoneCreds.get(chatId);
+    const creds  = await getFlyfoneCreds(chatId);
     if (!creds) {
       return replyBold(ctx, 'You need to /fetch once (to log in) before using /summary.');
     }
@@ -599,7 +739,9 @@ bot.command('summary',
 
     let rows;
     try {
-      rows = await downloadFlyfoneReport(dateStr, creds.email, creds.pass);
+      const jar = await loadCookies(chatId);
+const client = wrapper(axios.create({ jar, withCredentials: true }));
+      rows = await downloadFlyfoneReport(chatId, dateStr, creds.email, creds.pass, client, jar);
     } catch (err) {
       return replyBold(ctx, `Error fetching report: ${err.message}`);
     }
@@ -627,24 +769,31 @@ bot.command('summary',
 // ─────────────────────────────────────────────────────────────────────────────
 bot.on('message:text', async ctx => {
   const chatId = ctx.chat.id;
-  const sess = sessionMap.get(chatId);
+  const sess = await getSession(chatId);
   if (!sess) return;
 
   if (sess.step === 'await_email') {
     sess.email = ctx.message.text.trim();
     sess.step = 'await_pass';
-    sessionMap.set(chatId, sess);
+    await saveSession(chatId, sess);
     return replyBold(ctx, 'Enter your Flyfone password:');
   }
 
   if (sess.step === 'await_pass') {
     const pass = ctx.message.text.trim();
+    console.log(`➡️ [await_pass] chatId=${chatId} email=${sess.email}`);
     try {
-      await ensureLoggedIn(sess.email, pass);
-      flyfoneCreds.set(chatId, { email: sess.email, pass });
+      const jar = await loadCookies(chatId);
+      console.log('✔️ Loaded cookies:', jar);
+    const client = wrapper(axios.create({ jar, withCredentials: true }));
+
+     console.log('🛫 Calling ensureLoggedIn with:', { chatId, email: sess.email });
+     await ensureLoggedIn(chatId, sess.email, pass, client, jar );
+     console.log('✅ ensureLoggedIn succeeded');
+      await saveFlyfoneCreds(chatId, sess.email, pass);
 
       sess.step = 'await_mode';
-      sessionMap.set(chatId, sess);
+      await saveSession(chatId, sess);
 
       const kb = new InlineKeyboard()
         .text('Yes, link a sheet', 'linkSheet:yes')
@@ -656,18 +805,20 @@ bot.on('message:text', async ctx => {
       });
     } catch (err) {
       sess.step = 'await_email';
-      sessionMap.set(chatId, sess);
+      await saveSession(chatId, sess);
       return replyBold(ctx, 'Credentials invalid, try your Flyfone email again:');
     }
   }
 });
 
 async function startFetchFlow(ctx, email, pass, sheetId, dateStr = null) {
+  const chatId = ctx.chat.id; // Make sure this is defined
   const ds = dateStr || dayjs().subtract(1,'day').format('YYYY-MM-DD');
 
   try {
-    const rows = await downloadFlyfoneReport(ds, email, pass);
-
+const jar = await loadCookies(chatId);
+const client = wrapper(axios.create({ jar, withCredentials: true }));
+const rows = await downloadFlyfoneReport(chatId, ds, email, pass, client, jar);
     // raw, lowercase keys
     const raw = rows.slice(1).map(r => r[6]?.toString() || '').filter(Boolean);
 
@@ -675,8 +826,8 @@ async function startFetchFlow(ctx, email, pass, sheetId, dateStr = null) {
     if (sheetId) {
       const teamKeys = Array.from(new Set(raw.map(t => t.toLowerCase())));
   // merge into the existing session so we keep mode/sheet linkage
-  const prev = sessionMap.get(ctx.chat.id) || {};
-  sessionMap.set(ctx.chat.id, { 
+  const prev = await getSession(ctx.chat.id) || {};
+  await saveSession(ctx.chat.id, { 
     ...prev,
     rows,
     dateStr: ds,
@@ -699,8 +850,8 @@ async function startFetchFlow(ctx, email, pass, sheetId, dateStr = null) {
     }
 
   // merge into the existing session so we keep mode/sheet linkage
-  const prev = sessionMap.get(ctx.chat.id) || {};
-  sessionMap.set(ctx.chat.id, { 
+  const prev = await getSession(ctx.chat.id) || {};
+  await saveSession(ctx.chat.id, { 
     ...prev,
     rows,
     dateStr: ds,
@@ -729,11 +880,11 @@ async function startFetchFlow(ctx, email, pass, sheetId, dateStr = null) {
 // … in your team callback, instead of immediately calling writeToSheet…
 bot.callbackQuery(/^team:(.+)$/, withSessionGuard(async ctx => {
   const chatId = ctx.chat.id;
-  const prev = sessionMap.get(chatId) || {};
+  const prev = await getSession(chatId) || {};
   if (!prev) return ctx.answerCallbackQuery({ show_alert: true, text: 'Session expired.' });
 
   prev.selectedTeam = ctx.match[1];
-  sessionMap.set(chatId, prev);
+  await saveSession(chatId, prev);
 
   // Ask overwrite vs append:
   const kb = new InlineKeyboard()
@@ -749,7 +900,7 @@ bot.callbackQuery(/^team:(.+)$/, withSessionGuard(async ctx => {
 bot.callbackQuery(/^sheetMode:(overwrite|append)$/, withSessionGuard(async ctx => {
   const chatId = ctx.chat.id;
   const mode = ctx.match[1];                   // 'overwrite' or 'append'
-  const sess = sessionMap.get(chatId);
+  const sess = await getSession(chatId);
   const { rows, dateStr, sheetId, selectedTeam } = sess;
 
   // Filter & build output…
@@ -761,7 +912,6 @@ bot.callbackQuery(/^sheetMode:(overwrite|append)$/, withSessionGuard(async ctx =
   ];
 
   try {
-    await writeToSheet(chatId, sheetId, output, mode === 'overwrite');
     await writeToSheet(
       ctx.chat.id,
       sheetId,
@@ -782,36 +932,42 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended:false }));
 
 app.get('/oauth2callback', async (req, res) => {
+  console.log('🔔 /oauth2callback hit with state:', req.query.state);
   const { code, state } = req.query;
-  if (!code||!state) return res.status(400).send('Missing code or state.');
+  if (!code || !state) return res.status(400).send('Missing code or state.');
+
   let chatId;
-  try { ({ chatId } = JSON.parse(decodeURIComponent(state))); }
-  catch { return res.status(400).send('Invalid state.'); }
+  try {
+    ({ chatId } = JSON.parse(decodeURIComponent(state)));
+  } catch {
+    return res.status(400).send('Invalid state.');
+  }
 
   try {
     const { tokens } = await oauth2Client.getToken(code);
-    if (!tokens.refresh_token) {
-      console.warn('No refresh_token—user must re-consent.');
+
+    // FIX: Only save if we actually got a refresh token
+    if (tokens.refresh_token) {
+      // Store JUST the refresh token string, not the whole tokens object
+      await saveRefreshToken(chatId, tokens.refresh_token);
+      console.log('✔️ Saved refresh token for', chatId);
+    } else {
+      console.warn('⚠️ No refresh_token received - user must re-consent');
     }
-  const prev = googleCreds.get(chatId) || {};
-  googleCreds.set(chatId, { ...prev, refresh_token: tokens.refresh_token });  
+
     await bot.api.sendMessage(
       chatId,
-       '<b>Authorized! Do /fetch now.</b>',
-      { parse_mode:'HTML' }
+      '<b>Authorized! Do /fetch now.</b>',
+      { parse_mode: 'HTML' }
     );
-   // After a 3‑second delay, only if the refresh_token is really set...
-   res.send('Authorization successful! You can close this tab.');
+    res.send('Authorization successful! You can close this tab.');
   } catch (err) {
-    console.error(err);
-    res.status(500).send(`Auth error: ${err.message}`);
+    console.error('🔥 OAuth callback error:', err);
+    return res.status(500).send(`Auth error: ${err.message}`);
   }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
+});// ─────────────────────────────────────────────────────────────────────────────
 // Gracefully save state before shutdown
 // ─────────────────────────────────────────────────────────────────────────────
-process.on('exit', saveState);
 process.on('SIGINT', () => process.exit());
 process.on('SIGTERM', () => process.exit());
 
