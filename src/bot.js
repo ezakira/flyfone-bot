@@ -934,40 +934,64 @@ app.use(bodyParser.urlencoded({ extended:false }));
 
 app.get('/oauth2callback', async (req, res) => {
   console.log('🔔 /oauth2callback hit with state:', req.query.state);
-  const { code, state } = req.query;
-  if (!code || !state) return res.status(400).send('Missing code or state.');
+  const { code, state, error } = req.query; // Add error parameter
+  
+  // Handle OAuth errors from Google
+  if (error) {
+    console.error('❌ Google OAuth error:', error, req.query.error_description);
+    return res.status(400).send(`OAuth error: ${req.query.error_description}`);
+  }
 
+  if (!code || !state) return res.status(400).send('Missing code or state.');
+  
   let chatId;
   try {
     ({ chatId } = JSON.parse(decodeURIComponent(state)));
-  } catch {
+  } catch (err) {
+    console.error('❌ State parsing error:', err);
     return res.status(400).send('Invalid state.');
   }
 
   try {
     const { tokens } = await oauth2Client.getToken(code);
+    console.log('🔑 Tokens received:', tokens); // Log tokens for debugging
 
-    // FIX: Only save if we actually got a refresh token
     if (tokens.refresh_token) {
-      // Store JUST the refresh token string, not the whole tokens object
       await saveRefreshToken(chatId, tokens.refresh_token);
       console.log('✔️ Saved refresh token for', chatId);
+      
+      await bot.api.sendMessage(
+        chatId,
+        '<b>Authorized! Do /fetch now.</b>',
+        { parse_mode: 'HTML' }
+      );
+      res.send('Authorization successful! You can close this tab.');
     } else {
-      console.warn('⚠️ No refresh_token received - user must re-consent');
+      console.warn('⚠️ No refresh_token received');
+      await bot.api.sendMessage(
+        chatId,
+        '<b>Authorization incomplete! Please try again.</b>',
+        { parse_mode: 'HTML' }
+      );
+      res.send('Authorization failed - no refresh token received');
     }
-
-    await bot.api.sendMessage(
-      chatId,
-      '<b>Authorized! Do /fetch now.</b>',
-      { parse_mode: 'HTML' }
-    );
-    res.send('Authorization successful! You can close this tab.');
   } catch (err) {
     console.error('🔥 OAuth callback error:', err);
+    
+    // Send error to user
+    try {
+      await bot.api.sendMessage(
+        chatId,
+        `<b>Authorization failed:</b>\n<code>${err.message}</code>`,
+        { parse_mode: 'HTML' }
+      );
+    } catch (sendErr) {
+      console.error('Failed to send error to user:', sendErr);
+    }
+    
     return res.status(500).send(`Auth error: ${err.message}`);
   }
-});// ─────────────────────────────────────────────────────────────────────────────
-// Gracefully save state before shutdown
+});// Gracefully save state before shutdown
 // ─────────────────────────────────────────────────────────────────────────────
 process.on('SIGINT', () => process.exit());
 process.on('SIGTERM', () => process.exit());
