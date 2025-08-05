@@ -761,7 +761,7 @@ const client = wrapper(axios.create({ jar, withCredentials: true }));
     const header = `<b>Summary for ${team} on ${dateStr}:</b>`;
     const lines  = Object.entries(counts)
       .sort((a, b) => b[1] - a[1])
-      .map(([agent, c]) => `• <b>${agent}:</b> ${c}`);
+      .map(([agent, c]) => `• <b>${agent}: ${c}</b>`);
     return ctx.reply([header, ...lines].join('\n'), { parse_mode: 'HTML' });
   })
 );// ─────────────────────────────────────────────────────────────────────────────
